@@ -6,6 +6,7 @@ pub mod cmd;
 pub mod display;
 pub mod power;
 pub mod session;
+pub mod wifi;
 
 /// Shared application state (populated by later tasks).
 pub struct AppState {}
