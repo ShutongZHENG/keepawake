@@ -124,7 +124,7 @@ pub fn install_launch_agent(runner: &impl CommandRunner) -> std::io::Result<()> 
 /// rejects a `<domain>/<label>` service-target there (exit 64:
 /// "service-target takes a form of <domain-target>/<service-id>").
 /// The service-target form `gui/<uid>/<label>` stays reserved for
-/// `bootout`/`print` (see [`quit_commands`] and [`job_loaded`]).
+/// `bootout`/`print` (see [`quit_commands`] and [`agent_job_state`]).
 ///
 /// A non-zero bootstrap whose stderr mentions "already loaded" or the
 /// error-37 phrasings ("error: 37", "failed: 37", …) is `Ok` — first run
@@ -215,46 +215,80 @@ pub fn request_pmset(
 }
 
 /// Who owns this process at startup — single-instance ownership by
-/// launchd (controller Ruling 7).
+/// launchd (controller Ruling 7, refined by Ruling 8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupOwnership {
-    /// launchd spawned us (ppid 1): this is the owned agent instance —
-    /// run the normal tray/assertion/tick startup.
+    /// launchd spawned us (job running as our pid): this is the owned
+    /// agent instance — run the normal tray/assertion/tick startup.
     RunAsAgent,
-    /// Manual launch while the agent job is already loaded: an
-    /// agent-owned instance exists (or will be respawned by KeepAlive),
-    /// so exit 0 immediately — never show a second tray.
+    /// Manual launch while the agent job is already loaded (running as
+    /// another pid, or loaded-idle): an agent-owned instance exists (or
+    /// will be respawned by KeepAlive), so exit 0 immediately — never
+    /// show a second tray.
     ExitSilently,
     /// First-ever manual run: install the LaunchAgent (plist +
     /// bootstrap), then exit and hand off to launchd's `RunAtLoad`.
     InstallAndHandOff,
 }
 
-/// Pure startup-ownership decision: `ppid == 1` means launchd spawned
-/// this process; otherwise a loaded job means the agent already owns the
-/// single instance; otherwise this is the first run and must install
-/// before handing off.
-pub fn startup_ownership_decision(ppid: u32, job_loaded: bool) -> StartupOwnership {
-    if ppid == 1 {
-        StartupOwnership::RunAsAgent
-    } else if job_loaded {
-        StartupOwnership::ExitSilently
-    } else {
-        StartupOwnership::InstallAndHandOff
+/// The KeepAwake LaunchAgent's state in the user's gui domain, as
+/// reported by `launchctl print gui/<uid>/<label>` (Ruling 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    /// Job not registered (`launchctl print` non-zero exit).
+    NotLoaded,
+    /// Job registered and running as the given pid.
+    Running(u32),
+    /// Job registered but currently without a pid (`print` exits 0,
+    /// no `pid = ` line) — launchd owns it and will (re)start it.
+    LoadedIdle,
+}
+
+/// Query the LaunchAgent's job state: run
+/// `launchctl print gui/<uid>/<label>` (the service-target form `print`
+/// expects) and classify the result.
+///
+/// - non-zero exit (or spawn failure) → [`JobState::NotLoaded`]
+/// - exit 0 with a line whose trimmed form starts with `pid = ` →
+///   [`JobState::Running`] with the parsed pid
+/// - exit 0 without a pid line → [`JobState::LoadedIdle`]
+pub fn agent_job_state(runner: &impl CommandRunner, uid: u32) -> JobState {
+    let target = format!("gui/{uid}/{AGENT_LABEL}");
+    match runner.run("launchctl", &["print", &target]) {
+        Ok(output) => {
+            if !output.status.success() {
+                return JobState::NotLoaded;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("pid = ") {
+                    if let Ok(pid) = rest.trim().parse::<u32>() {
+                        return JobState::Running(pid);
+                    }
+                }
+            }
+            JobState::LoadedIdle
+        }
+        Err(err) => {
+            eprintln!("keepawake: launchctl print {target}: {err}");
+            JobState::NotLoaded
+        }
     }
 }
 
-/// Whether the KeepAwake LaunchAgent is loaded in the user's gui domain:
-/// `launchctl print gui/<uid>/<label>` — the service-target form `print`
-/// expects — exiting 0. A spawn failure also counts as "not loaded".
-pub fn job_loaded(runner: &impl CommandRunner, uid: u32) -> bool {
-    let target = format!("gui/{uid}/{AGENT_LABEL}");
-    match runner.run("launchctl", &["print", &target]) {
-        Ok(output) => output.status.success(),
-        Err(err) => {
-            eprintln!("keepawake: launchctl print {target}: {err}");
-            false
-        }
+/// Pure startup-ownership decision from the job state and *our* pid
+/// (`std::process::id()`). Comparing the pid reported by
+/// `launchctl print` against our own pid is the reliable discriminator:
+/// macOS LaunchServices spawns first-ever double-click runs as direct
+/// children of launchd (ppid 1), so a ppid heuristic over-matches and
+/// would skip the install on the primary end-user path.
+pub fn startup_ownership_decision(job: JobState, my_pid: u32) -> StartupOwnership {
+    match job {
+        JobState::NotLoaded => StartupOwnership::InstallAndHandOff,
+        JobState::Running(p) if p == my_pid => StartupOwnership::RunAsAgent,
+        JobState::Running(_) => StartupOwnership::ExitSilently,
+        JobState::LoadedIdle => StartupOwnership::ExitSilently,
     }
 }
 
@@ -475,27 +509,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // ---- Task 8 review fix: single-instance ownership (Ruling 7) ----
+    // ---- Task 8 fix round 2: job-pid ownership (Ruling 8) ----
 
-    /// Mandated decision table: ppid 1 (launched by launchd) always runs
-    /// as the agent; otherwise a loaded job means an agent-owned instance
-    /// already exists (exit silently); otherwise first-ever run installs
-    /// and hands off to launchd.
+    /// Mandated decision table: no job → install and hand off; job
+    /// running as *our* pid → we are the agent; job running as any other
+    /// pid → exit silently; job loaded but idle → exit silently (launchd
+    /// owns it and will (re)start it).
     #[test]
     fn startup_ownership_decision_table() {
         use StartupOwnership::*;
-        assert_eq!(startup_ownership_decision(1, false), RunAsAgent);
-        assert_eq!(startup_ownership_decision(1, true), RunAsAgent);
-        assert_eq!(startup_ownership_decision(501, true), ExitSilently);
-        assert_eq!(startup_ownership_decision(501, false), InstallAndHandOff);
+        let my_pid = 100;
+        assert_eq!(
+            startup_ownership_decision(JobState::NotLoaded, my_pid),
+            InstallAndHandOff
+        );
+        assert_eq!(
+            startup_ownership_decision(JobState::Running(my_pid), my_pid),
+            RunAsAgent
+        );
+        assert_eq!(
+            startup_ownership_decision(JobState::Running(4242), my_pid),
+            ExitSilently
+        );
+        assert_eq!(
+            startup_ownership_decision(JobState::LoadedIdle, my_pid),
+            ExitSilently
+        );
     }
 
-    /// `job_loaded` runs `launchctl print gui/<uid>/<label>` and reports
-    /// true exactly when it exits 0 (job present in the gui domain).
+    /// Non-zero `launchctl print` exit (job absent) → NotLoaded, and the
+    /// argv is pinned to the service-target form
+    /// `["print", "gui/501/com.keepawake.app"]`.
     #[test]
-    fn job_loaded_is_true_on_exit_zero_and_pins_service_target() {
-        let fake = FakeRunner::with_stdout("service = com.keepawake.app\n");
-        assert!(job_loaded(&fake, 501));
+    fn agent_job_state_is_not_loaded_on_nonzero_exit() {
+        let fake = FakeRunner::with_stdout("").failing_with(113, "Could not find service\n");
+        assert_eq!(agent_job_state(&fake, 501), JobState::NotLoaded);
 
         let calls = fake.calls.lock().expect("FakeRunner calls lock");
         assert_eq!(calls.len(), 1);
@@ -509,11 +557,46 @@ mod tests {
         );
     }
 
-    /// Non-zero `launchctl print` exit (job absent) → false; the runner
-    /// failing to spawn at all also means "not loaded".
+    /// Exit 0 with a `pid = 4242` line inside a realistic
+    /// `launchctl print` snippet → Running(4242).
     #[test]
-    fn job_loaded_is_false_on_nonzero_exit() {
-        let fake = FakeRunner::with_stdout("").failing_with(113, "Could not find service\n");
-        assert!(!job_loaded(&fake, 501));
+    fn agent_job_state_is_running_when_stdout_reports_pid() {
+        let stdout = "gui/501/com.keepawake.app = {\n\
+            \tactive count = 1\n\
+            \tpath = /Users/dev/Library/LaunchAgents/com.keepawake.app.plist\n\
+            \tstate = running\n\
+            \n\
+            \tpid = 4242\n\
+            \tlast exit code = 0\n\
+            \n\
+            \trun interval = 3600s\n\
+            }\n";
+        let fake = FakeRunner::with_stdout(stdout);
+        assert_eq!(agent_job_state(&fake, 501), JobState::Running(4242));
+
+        let calls = fake.calls.lock().expect("FakeRunner calls lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "launchctl");
+        assert_eq!(
+            calls[0].1,
+            vec![
+                "print".to_string(),
+                "gui/501/com.keepawake.app".to_string()
+            ]
+        );
+    }
+
+    /// Exit 0 without any `pid = ` line → LoadedIdle (registered but
+    /// not currently running; launchd will start it).
+    #[test]
+    fn agent_job_state_is_loaded_idle_on_exit_zero_without_pid() {
+        let stdout = "gui/501/com.keepawake.app = {\n\
+            \tactive count = 0\n\
+            \tpath = /Users/dev/Library/LaunchAgents/com.keepawake.app.plist\n\
+            \tstate = not running\n\
+            \tlast exit code = 0\n\
+            }\n";
+        let fake = FakeRunner::with_stdout(stdout);
+        assert_eq!(agent_job_state(&fake, 501), JobState::LoadedIdle);
     }
 }

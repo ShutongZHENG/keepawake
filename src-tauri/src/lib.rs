@@ -14,15 +14,18 @@ use cmd::SystemRunner;
 use tauri::Manager;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Single-instance ownership by launchd (Ruling 7). Decided here,
+    // Single-instance ownership by launchd (Ruling 8). Decided here,
     // BEFORE `tauri::Builder` — hence strictly before the tray exists —
     // so an exiting instance never shows a tray icon, and `return Ok(())`
     // below actually returns from `run()` (process exits 0).
-    // SAFETY: `getppid(2)`/`getuid(2)` have no preconditions and cannot fail.
-    let ppid = unsafe { libc::getppid() } as u32;
+    // Compare the pid reported by `launchctl print` against our own pid:
+    // ppid is unreliable (LaunchServices spawns double-click runs as
+    // direct children of launchd, ppid 1).
+    let my_pid = std::process::id();
+    // SAFETY: `getuid(2)` has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
-    let loaded = setup::job_loaded(&SystemRunner, uid);
-    match setup::startup_ownership_decision(ppid, loaded) {
+    let job = setup::agent_job_state(&SystemRunner, uid);
+    match setup::startup_ownership_decision(job, my_pid) {
         setup::StartupOwnership::RunAsAgent => {
             // Owned instance (launchd spawned us): continue normal
             // startup below. No install refresh — the job is loaded by
