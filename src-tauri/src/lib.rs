@@ -5,6 +5,7 @@ pub mod assertion;
 pub mod cmd;
 pub mod display;
 pub mod power;
+pub mod session;
 
 /// Shared application state (populated by later tasks).
 pub struct AppState {}
