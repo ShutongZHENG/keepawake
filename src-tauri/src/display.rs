@@ -16,17 +16,22 @@ pub enum ScreenCmd {
 }
 
 /// Tracks whether the display should be awake and owns the wake-hold guard.
+///
+/// The factory bound is `Send + Sync` so the controller can live inside
+/// `AppState`, which is shared with the tokio tick loop (Task 6).
 pub struct DisplayController {
     awake: bool,
     wake_hold: Option<AssertionGuard>,
-    make_hold: Box<dyn Fn() -> Result<AssertionGuard, String>>,
+    make_hold: Box<dyn Fn() -> Result<AssertionGuard, String> + Send + Sync>,
 }
 
 impl DisplayController {
     /// Create a controller whose wake-hold guards come from `make_hold`.
     /// Production passes [`crate::assertion::assert_prevent_display_sleep`]
     /// (see [`DisplayController::production`]); tests pass a fake factory.
-    pub fn with_factory(make_hold: Box<dyn Fn() -> Result<AssertionGuard, String>>) -> Self {
+    pub fn with_factory(
+        make_hold: Box<dyn Fn() -> Result<AssertionGuard, String> + Send + Sync>,
+    ) -> Self {
         Self {
             awake: false,
             wake_hold: None,
