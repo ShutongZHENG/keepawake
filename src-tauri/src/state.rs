@@ -297,17 +297,49 @@ fn execute_screen_cmd(runner: &SystemRunner, cmd: ScreenCmd) {
     }
 }
 
+/// Whether the `pid == None` streak is due for a `pgrep` re-discovery:
+/// at most once every 3 ticks (streaks 1, 4, 7, …).
+fn should_rediscover(none_streak: u32) -> bool {
+    none_streak % 3 == 1
+}
+
+/// Pure core of the tick loop's `pid == None` branch: advance the streak,
+/// re-run discovery via `found` on cadence ([`should_rediscover`]), and
+/// report this tick's `urnot_detected`. On success the pid is stored and
+/// the streak resets — `urnot_detected` clears on that same tick, while
+/// `sample_now` for the new pid resumes from the next tick. `None` is not a
+/// terminal state: without this, a UURemoteServer that starts after
+/// KeepAwake (login-item race) or restarts later would stay undetected
+/// until app restart.
+fn none_tick(
+    pid: &mut Option<u32>,
+    none_streak: &mut u32,
+    found: impl FnOnce() -> Option<u32>,
+) -> bool {
+    *none_streak += 1;
+    if should_rediscover(*none_streak) {
+        if let Some(id) = found() {
+            *pid = Some(id);
+            *none_streak = 0;
+        }
+    }
+    pid.is_none()
+}
+
 /// 5-second scheduler: gather real inputs, tick the display controller,
 /// [`combine`] them into an [`AppStatus`], execute the display cmds, and
 /// emit `status_update` for the tray. Never panics; system-call failures
 /// log to stderr and the loop continues with last-known values.
 pub async fn tick_loop(app: tauri::AppHandle) {
-    // UURemoteServer pid discovered once at loop start (Ruling 5).
+    // UURemoteServer pid: initial discovery at loop start (Ruling 5),
+    // re-discovered after 3 nettop misses and, from the None state, at
+    // most every 3 ticks via `none_tick`.
     let mut pid = {
         let state = app.state::<AppState>();
         discover_pid(&state.runner)
     };
     let mut pid_misses: u32 = 0;
+    let mut none_streak: u32 = 0;
     let mut prev_lid_open: Option<bool> = None;
 
     loop {
@@ -352,9 +384,15 @@ pub async fn tick_loop(app: tauri::AppHandle) {
                             (detector.observe(0, now), pid.is_none())
                         }
                     },
-                    // No pid: urnot_detected every tick, detector fed as
-                    // idle, sample_now never called (Ruling 5).
-                    None => (detector.observe(0, now), true),
+                    // No pid: detector fed as idle, sample_now never called
+                    // (Ruling 5). Not terminal — `none_tick` re-runs pgrep
+                    // at most every 3 ticks; on success the pid is stored
+                    // and urnot_detected clears this same tick (session
+                    // sampling resumes next tick).
+                    None => (
+                        detector.observe(0, now),
+                        none_tick(&mut pid, &mut none_streak, || discover_pid(runner)),
+                    ),
                 }
             };
 
@@ -609,5 +647,53 @@ mod tests {
         let json = serde_json::to_string(&status).expect("AppStatus must serialize");
         let back: AppStatus = serde_json::from_str(&json).expect("AppStatus must deserialize");
         assert_eq!(back, status);
+    }
+
+    /// Re-discovery from the `None` state must run at most once every 3
+    /// ticks (cheap `pgrep -f UURemoteServer`): true at streaks 1, 4, 7, …
+    #[test]
+    fn should_rediscover_every_third_none_tick() {
+        let expected = [
+            (0, false), // streak is incremented before the check
+            (1, true),
+            (2, false),
+            (3, false),
+            (4, true),
+            (5, false),
+            (6, false),
+            (7, true),
+        ];
+        for (streak, want) in expected {
+            assert_eq!(
+                should_rediscover(streak),
+                want,
+                "streak {streak} should_rediscover"
+            );
+        }
+    }
+
+    /// `pid == None` must not be terminal: a successful re-discovery stores
+    /// the pid, resets the streak, and clears `urnot_detected` on that same
+    /// tick (session sampling resumes the next tick).
+    #[test]
+    fn none_tick_rediscovery_clears_urnot_same_tick() {
+        let mut pid: Option<u32> = None;
+        let mut streak = 0u32;
+
+        // Failed attempts at streaks 1 and 4; cadence ticks in between.
+        assert!(none_tick(&mut pid, &mut streak, || None));
+        assert!(none_tick(&mut pid, &mut streak, || None));
+        assert!(none_tick(&mut pid, &mut streak, || None));
+        assert!(none_tick(&mut pid, &mut streak, || None)); // streak 4: attempt
+        assert_eq!(pid, None, "still absent after failed attempts");
+        assert_eq!(streak, 4, "streak keeps advancing past failed attempts");
+
+        // Streak 7 attempt succeeds → pid stored, urnot clears same tick.
+        none_tick(&mut pid, &mut streak, || None); // 5
+        none_tick(&mut pid, &mut streak, || None); // 6
+        let urnot = none_tick(&mut pid, &mut streak, || Some(4242)); // 7: attempt
+        assert_eq!(pid, Some(4242));
+        assert_eq!(streak, 0, "streak resets on success");
+        assert!(!urnot, "urnot_detected must clear on the rediscovery tick");
     }
 }
