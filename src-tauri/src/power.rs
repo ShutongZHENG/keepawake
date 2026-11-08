@@ -29,8 +29,23 @@ pub fn parse_pmset_g(text: &str) -> PowerSettings {
 }
 
 /// Run `pmset -g` through `runner` and parse the captured stdout.
+///
+/// Returns an error if the command could not be spawned or exited
+/// non-zero (stderr included in the message when present) — a failed
+/// `pmset` is never silently reported as a successful read.
 pub fn current_settings(runner: &impl CommandRunner) -> std::io::Result<PowerSettings> {
     let output = runner.run("pmset", &["-g"])?;
+    if !output.status.success() {
+        let status = output.status;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let message = if stderr.is_empty() {
+            format!("pmset -g failed with {status}")
+        } else {
+            format!("pmset -g failed with {status}: {stderr}")
+        };
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, message));
+    }
     Ok(parse_pmset_g(&String::from_utf8_lossy(&output.stdout)))
 }
 
