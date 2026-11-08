@@ -1,7 +1,9 @@
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 
+pub mod assertion;
 pub mod cmd;
+pub mod display;
 pub mod power;
 
 /// Shared application state (populated by later tasks).
