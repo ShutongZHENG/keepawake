@@ -118,7 +118,13 @@ pub fn install_launch_agent(runner: &impl CommandRunner) -> std::io::Result<()> 
 
 /// Write `plist_content(current_exe)` to `<home>/Library/LaunchAgents/`
 /// (creating the directory) and run
-/// `launchctl bootstrap gui/<uid>/<label> <path>` through `runner`.
+/// `launchctl bootstrap gui/<uid> <path>` through `runner`.
+///
+/// The bootstrap target is the **domain** form `gui/<uid>` — launchctl
+/// rejects a `<domain>/<label>` service-target there (exit 64:
+/// "service-target takes a form of <domain-target>/<service-id>").
+/// The service-target form `gui/<uid>/<label>` stays reserved for
+/// `bootout`/`print` (see [`quit_commands`] and [`job_loaded`]).
 ///
 /// A non-zero bootstrap whose stderr mentions "already loaded" or the
 /// error-37 phrasings ("error: 37", "failed: 37", …) is `Ok` — first run
@@ -140,7 +146,7 @@ pub fn install_launch_agent_at(
     }
     std::fs::write(&path, plist_content(&exe.to_string_lossy()))?;
 
-    let target = format!("gui/{uid}/{AGENT_LABEL}");
+    let target = format!("gui/{uid}");
     let path_str = path.to_string_lossy().into_owned();
     let output = runner.run("launchctl", &["bootstrap", &target, &path_str])?;
     if output.status.success() {
@@ -206,6 +212,50 @@ pub fn request_pmset(
         return Err(std::io::Error::new(std::io::ErrorKind::Other, message));
     }
     Ok(output)
+}
+
+/// Who owns this process at startup — single-instance ownership by
+/// launchd (controller Ruling 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupOwnership {
+    /// launchd spawned us (ppid 1): this is the owned agent instance —
+    /// run the normal tray/assertion/tick startup.
+    RunAsAgent,
+    /// Manual launch while the agent job is already loaded: an
+    /// agent-owned instance exists (or will be respawned by KeepAlive),
+    /// so exit 0 immediately — never show a second tray.
+    ExitSilently,
+    /// First-ever manual run: install the LaunchAgent (plist +
+    /// bootstrap), then exit and hand off to launchd's `RunAtLoad`.
+    InstallAndHandOff,
+}
+
+/// Pure startup-ownership decision: `ppid == 1` means launchd spawned
+/// this process; otherwise a loaded job means the agent already owns the
+/// single instance; otherwise this is the first run and must install
+/// before handing off.
+pub fn startup_ownership_decision(ppid: u32, job_loaded: bool) -> StartupOwnership {
+    if ppid == 1 {
+        StartupOwnership::RunAsAgent
+    } else if job_loaded {
+        StartupOwnership::ExitSilently
+    } else {
+        StartupOwnership::InstallAndHandOff
+    }
+}
+
+/// Whether the KeepAwake LaunchAgent is loaded in the user's gui domain:
+/// `launchctl print gui/<uid>/<label>` — the service-target form `print`
+/// expects — exiting 0. A spawn failure also counts as "not loaded".
+pub fn job_loaded(runner: &impl CommandRunner, uid: u32) -> bool {
+    let target = format!("gui/{uid}/{AGENT_LABEL}");
+    match runner.run("launchctl", &["print", &target]) {
+        Ok(output) => output.status.success(),
+        Err(err) => {
+            eprintln!("keepawake: launchctl print {target}: {err}");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -355,7 +405,10 @@ mod tests {
     }
 
     /// (c) Install writes the expanded plist (creating the LaunchAgents
-    /// dir) and bootstraps `gui/<uid>/<label>` pointing at that path.
+    /// dir) and bootstraps with the *domain-target* form
+    /// `launchctl bootstrap gui/<uid> <path>` — launchctl rejects a
+    /// label segment in the bootstrap target (exit 64: "service-target
+    /// takes a form of <domain-target>/<service-id>").
     #[test]
     fn install_launch_agent_writes_plist_and_bootstraps() {
         let home = temp_home("install");
@@ -377,7 +430,7 @@ mod tests {
             calls[0].1,
             vec![
                 "bootstrap".to_string(),
-                "gui/501/com.keepawake.app".to_string(),
+                "gui/501".to_string(),
                 plist.to_string_lossy().to_string()
             ]
         );
@@ -420,5 +473,47 @@ mod tests {
             .expect_err("unrelated bootstrap failures must be Err");
         assert!(err.to_string().contains("Input/output error"), "got: {err}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---- Task 8 review fix: single-instance ownership (Ruling 7) ----
+
+    /// Mandated decision table: ppid 1 (launched by launchd) always runs
+    /// as the agent; otherwise a loaded job means an agent-owned instance
+    /// already exists (exit silently); otherwise first-ever run installs
+    /// and hands off to launchd.
+    #[test]
+    fn startup_ownership_decision_table() {
+        use StartupOwnership::*;
+        assert_eq!(startup_ownership_decision(1, false), RunAsAgent);
+        assert_eq!(startup_ownership_decision(1, true), RunAsAgent);
+        assert_eq!(startup_ownership_decision(501, true), ExitSilently);
+        assert_eq!(startup_ownership_decision(501, false), InstallAndHandOff);
+    }
+
+    /// `job_loaded` runs `launchctl print gui/<uid>/<label>` and reports
+    /// true exactly when it exits 0 (job present in the gui domain).
+    #[test]
+    fn job_loaded_is_true_on_exit_zero_and_pins_service_target() {
+        let fake = FakeRunner::with_stdout("service = com.keepawake.app\n");
+        assert!(job_loaded(&fake, 501));
+
+        let calls = fake.calls.lock().expect("FakeRunner calls lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "launchctl");
+        assert_eq!(
+            calls[0].1,
+            vec![
+                "print".to_string(),
+                "gui/501/com.keepawake.app".to_string()
+            ]
+        );
+    }
+
+    /// Non-zero `launchctl print` exit (job absent) → false; the runner
+    /// failing to spawn at all also means "not loaded".
+    #[test]
+    fn job_loaded_is_false_on_nonzero_exit() {
+        let fake = FakeRunner::with_stdout("").failing_with(113, "Could not find service\n");
+        assert!(!job_loaded(&fake, 501));
     }
 }

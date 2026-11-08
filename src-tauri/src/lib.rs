@@ -14,6 +14,38 @@ use cmd::SystemRunner;
 use tauri::Manager;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Single-instance ownership by launchd (Ruling 7). Decided here,
+    // BEFORE `tauri::Builder` — hence strictly before the tray exists —
+    // so an exiting instance never shows a tray icon, and `return Ok(())`
+    // below actually returns from `run()` (process exits 0).
+    // SAFETY: `getppid(2)`/`getuid(2)` have no preconditions and cannot fail.
+    let ppid = unsafe { libc::getppid() } as u32;
+    let uid = unsafe { libc::getuid() };
+    let loaded = setup::job_loaded(&SystemRunner, uid);
+    match setup::startup_ownership_decision(ppid, loaded) {
+        setup::StartupOwnership::RunAsAgent => {
+            // Owned instance (launchd spawned us): continue normal
+            // startup below. No install refresh — the job is loaded by
+            // definition, so the plist is (re)written only by
+            // InstallAndHandOff (documented choice in task-8-report).
+        }
+        setup::StartupOwnership::ExitSilently => {
+            // Manual launch while the agent owns the instance: exit 0
+            // without building the app (no tray, no tick loop).
+            eprintln!("keepawake: agent instance already owned by launchd; exiting");
+            return Ok(());
+        }
+        setup::StartupOwnership::InstallAndHandOff => {
+            // First-ever run: write the plist + `launchctl bootstrap
+            // gui/<uid> <path>` (best-effort), then hand off — launchd's
+            // RunAtLoad spawns the owned instance immediately.
+            if let Err(err) = setup::install_launch_agent(&SystemRunner) {
+                eprintln!("keepawake: install launch agent: {err}");
+            }
+            return Ok(());
+        }
+    }
+
     tauri::Builder::default()
         .manage(AppState::new())
         .setup(|app| {
@@ -34,11 +66,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // KeepAlive LaunchAgent: best-effort install; a failure (e.g.
-            // LaunchAgents dir missing/unwritable) must not stop the app.
-            if let Err(err) = setup::install_launch_agent(&SystemRunner) {
-                eprintln!("keepawake: install launch agent: {err}");
-            }
+            // (LaunchAgent install lives in the ownership decision above:
+            // InstallAndHandOff installs then exits; RunAsAgent skips
+            // re-install because the job is already loaded.)
 
             // First-run warning: reveal `act_setup` while system sleep is
             // still enabled (or `pmset -g` cannot be read) so the user can
