@@ -111,26 +111,44 @@ pub fn parse_preferred_networks(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Read the associated SSID via `ipconfig getsummary <dev>`; `None` on spawn
-/// error, parse miss, or a disassociated summary.
-pub fn current_ssid(runner: &impl CommandRunner, dev: &str) -> Option<String> {
-    let output = runner.run("ipconfig", &["getsummary", dev]).ok()?;
-    parse_ssid_from_summary(&String::from_utf8_lossy(&output.stdout))
+/// Read the associated SSID via `system_profiler SPAirPortDataType`; `None`
+/// on spawn error or parse miss (e.g. disassociated).
+pub fn current_ssid(runner: &impl CommandRunner) -> Option<String> {
+    let output = runner.run("system_profiler", &["SPAirPortDataType"]).ok()?;
+    parse_current_network(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Pull the SSID out of `ipconfig getsummary` text: the first line containing
-/// `SSID` with a non-empty value after `:`. Output mentioning
-/// "not associated" (or no such line / an empty value) → `None`.
-pub fn parse_ssid_from_summary(text: &str) -> Option<String> {
-    if text.contains("not associated") {
-        return None;
-    }
-    for line in text.lines() {
-        if line.contains("SSID") {
-            if let Some((_, value)) = line.split_once(':') {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
+/// Extract the current network name from `system_profiler SPAirPortDataType`
+/// output: scope to the top-level `Wi-Fi:` section; within it, after the first
+/// `Current Network Information:` header, the name is the first subsequent
+/// line that ends with `:` and has nothing after it (e.g. `ZTE-A7UPhK:`).
+/// Lines with a value after the colon (keys like `PHY Mode: 802.11ac`) are
+/// ignored, as are other interfaces' `Current Network Information:` blocks
+/// (their first line is `Network Type: Infrastructure`, never a bare name).
+/// No Wi-Fi section, no header, or no name line → `None`.
+pub fn parse_current_network(profile: &str) -> Option<String> {
+    let mut in_wifi = false;
+    let mut after_header = false;
+    for line in profile.lines() {
+        let trimmed = line.trim();
+        if !in_wifi {
+            if trimmed == "Wi-Fi:" {
+                in_wifi = true;
+            }
+            continue;
+        }
+        // A new top-level section (column 0) closes the Wi-Fi section.
+        if !line.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
+            break;
+        }
+        if trimmed == "Current Network Information:" {
+            after_header = true;
+            continue;
+        }
+        if after_header {
+            if let Some(name) = trimmed.strip_suffix(':') {
+                if !name.is_empty() {
+                    return Some(name.to_string());
                 }
             }
         }
@@ -208,38 +226,94 @@ Ethernet Address: <null>
         assert_eq!(parse_preferred_networks(""), Vec::<String>::new());
     }
 
+    /// Realistic `system_profiler SPAirPortDataType` excerpt: Wi-Fi section,
+    /// en0 connected to `ZTE-A7UPhK`.
+    const WIFI_CONNECTED: &str = "\
+Wi-Fi:
+
+      Software Versions:
+          CoreWLAN: 16.0 (1657)
+          CoreWLANKit: 16.0 (1657)
+      Interfaces:
+        en0:
+          Card Type: Wi-Fi  (0x14E4, 0x173)
+          MAC Address: 8c:85:90:22:16:fc
+          Status: Connected
+          Current Network Information:
+            ZTE-A7UPhK:
+              PHY Mode: 802.11ac
+              Channel: 48 (5GHz, 80MHz)
+              Network Type: Infrastructure
+              Security: WPA2 Personal
+              Signal / Noise: -42 dBm / -93 dBm
+";
+
     #[test]
     fn parses_ssid_when_associated() {
-        let summary = "\
-ipconfig getsummary en0
-[...]
-SSID : HomeNet
-Router : 192.168.1.1
-";
-        assert_eq!(parse_ssid_from_summary(summary), Some("HomeNet".to_string()));
+        assert_eq!(
+            parse_current_network(WIFI_CONNECTED),
+            Some("ZTE-A7UPhK".to_string())
+        );
     }
 
     #[test]
     fn no_ssid_when_disassociated() {
-        // No SSID line at all.
-        assert_eq!(parse_ssid_from_summary("Router : 192.168.1.1\n"), None);
-        // Disassociated marker wins outright.
+        // No Wi-Fi section at all.
+        assert_eq!(parse_current_network("Ethernet:\n  Link Speed: 1000\n"), None);
+        // Wi-Fi section present but no Current Network Information header.
+        assert_eq!(parse_current_network("Wi-Fi:\n      Interfaces:\n        en0:\n          Status: Off\n"), None);
+        // Header present but no name line under it (awdl0-style block).
         assert_eq!(
-            parse_ssid_from_summary("You are not associated with an AirPort network."),
+            parse_current_network(
+                "Wi-Fi:\n        awdl0:\n          Current Network Information:\n              Network Type: Infrastructure\n"
+            ),
             None
         );
-        // SSID line present but empty.
-        assert_eq!(parse_ssid_from_summary("SSID : \n"), None);
+        // Empty output.
+        assert_eq!(parse_current_network(""), None);
     }
 
     #[test]
-    fn current_ssid_invokes_ipconfig_getsummary() {
-        let fake = FakeRunner::with_stdout("SSID : HomeNet\n");
-        assert_eq!(current_ssid(&fake, "en0"), Some("HomeNet".to_string()));
+    fn current_ssid_invokes_system_profiler() {
+        let fake = FakeRunner::with_stdout(WIFI_CONNECTED);
+        assert_eq!(current_ssid(&fake), Some("ZTE-A7UPhK".to_string()));
         let calls = fake.calls.lock().expect("calls lock");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "ipconfig");
-        assert_eq!(calls[0].1, vec!["getsummary", "en0"]);
+        assert_eq!(calls[0].0, "system_profiler");
+        assert_eq!(calls[0].1, vec!["SPAirPortDataType"]);
+    }
+
+    #[test]
+    fn second_current_network_block_does_not_override_wifi_name() {
+        // Second `Current Network Information:` block (awdl0-style: first line
+        // `Network Type: Infrastructure`) plus BSSID/MAC-address-style lines —
+        // none of which may be parsed as a name or a MAC.
+        let profile = "\
+Wi-Fi:
+      Interfaces:
+        en0:
+          MAC Address: 8c:85:90:22:16:fc
+          BSSID: 8c:85:90:22:16:fc
+          Current Network Information:
+            ZTE-A7UPhK:
+              PHY Mode: 802.11ac
+              Network Type: Infrastructure
+        awdl0:
+          MAC Address: 5a:b6:b0:a4:4a:78
+          Current Network Information:
+              Network Type: Infrastructure
+              Security: None
+";
+        assert_eq!(parse_current_network(profile), Some("ZTE-A7UPhK".to_string()));
+        // A MAC-looking value after a colon is never taken as the name.
+        let mac_only = "\
+Wi-Fi:
+        en0:
+          BSSID: 8c:85:90:22:16:fc
+          Current Network Information:
+              BSSID: 8c:85:90:22:16:fc
+";
+        assert_eq!(parse_current_network(mac_only), None);
     }
 
     #[test]
